@@ -30,16 +30,19 @@ class EmailClient(NotificationClient):
         """
         email: str = self.config.get("email")
         password: str = self.config.get("password")
-        email_text = self.__construct_email_text(email, message)
-        to = 'greta.gurgenyan@gmail.com'
+        # Recipient: optional `to` or `to_email`; otherwise send to self (same as `email`)
+        to_addr = (
+            self.config.get("to") or self.config.get("to_email") or email
+        ).strip()
+        email_text = self.__construct_email_text(email, to_addr, message)
         smtp_server = smtplib.SMTP_SSL("smtp.gmail.com", 465)
         smtp_server.ehlo()
         smtp_server.login(email, password)
-        smtp_server.sendmail(email, to, email_text)
+        smtp_server.sendmail(email, to_addr, email_text)
         smtp_server.close()
-        logging.info("Email sent successfully!")
+        logging.info("Email sent successfully to %s", to_addr)
 
-    def __construct_email_text(self, email: str, message: str) -> str:
+    def __construct_email_text(self, from_addr: str, to_addr: str, message: str) -> str:
         """
         Constructs a formatted email text with sender, receiver, subject,
         and message body.
@@ -50,4 +53,7 @@ class EmailClient(NotificationClient):
         Returns:
             str: The formatted email text ready for sending.
         """
-        return f"From: {email}\nTo: {email}\nSubject: VFS Appointment Bot Notification\n\n{message}"
+        return (
+            f"From: {from_addr}\nTo: {to_addr}\n"
+            f"Subject: VFS Appointment Bot Notification\n\n{message}"
+        )

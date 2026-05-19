@@ -1,7 +1,9 @@
 import argparse
 import logging
+import os
+import time
 from abc import ABC, abstractmethod
-from typing import Dict, List
+from typing import Dict, List, Optional
 from pathlib import Path
 
 import playwright
@@ -71,6 +73,7 @@ class VfsBot(ABC):
         with sync_playwright() as p:
             page = None
             context = None
+            browser = None
             connected_via_cdp = False
 
             # Try to attach to a real Chrome started with --remote-debugging-port=9222
@@ -78,24 +81,71 @@ class VfsBot(ABC):
                 logging.info("🔌 Trying to attach to Chrome over CDP (localhost:9222)…")
                 browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
                 context = browser.contexts[0] if browser.contexts else browser.new_context()
-                page = context.new_page()
+                page = (
+                    context.pages[0]
+                    if context.pages
+                    else context.new_page()
+                )
                 connected_via_cdp = True
                 logging.info("✅ Attached via CDP.")
             except Exception:
                 logging.info("ℹ️ CDP attach failed — launching persistent Chrome profile instead…")
-                # Fall back to launching user Chrome with a persistent profile
-                context = p.chromium.launch_persistent_context(
-                    user_data_dir="/tmp/vfs-profile",
-                    channel="chrome",                 # use system Chrome
-                    headless=False,                   # IMPORTANT for CF/Turnstile
-                    args=[
-                        "--start-maximized",
-                        "--disable-blink-features=AutomationControlled",
-                    ],
-                    ignore_default_args=["--enable-automation"],
+                base_profile = get_config_value(
+                    "browser", "user_data_dir", "/tmp/vfs-profile"
                 )
-                page = context.pages[0] if context.pages else context.new_page()
-                logging.info("✅ Launched persistent Chrome context.")
+                profile_candidates = [
+                    base_profile,
+                    f"{base_profile}-{os.getpid()}",
+                    f"{base_profile}-{os.getpid()}-{int(time.time())}",
+                ]
+                context = None
+                last_launch_error: Optional[Exception] = None
+                for user_data_dir in profile_candidates:
+                    try:
+                        logging.info("Trying Chrome user-data-dir: %s", user_data_dir)
+                        # Large window; use no_viewport so layout matches the real window
+                        # (fixed viewport + window-size often mis-centers pages on macOS/Retina).
+                        _bw, _bh = 2560, 1440
+                        context = p.chromium.launch_persistent_context(
+                            user_data_dir=user_data_dir,
+                            channel="chrome",
+                            headless=False,
+                            no_viewport=True,
+                            args=[
+                                f"--window-size={_bw},{_bh}",
+                                "--window-position=0,0",
+                                "--disable-blink-features=AutomationControlled",
+                            ],
+                            ignore_default_args=["--enable-automation"],
+                        )
+                        page = (
+                            context.pages[0]
+                            if context.pages
+                            else context.new_page()
+                        )
+                        logging.info(
+                            "✅ Launched persistent Chrome (profile %s). "
+                            "Tip: close regular Chrome or use another dir if you see "
+                            "\"Opening in existing browser session\".",
+                            user_data_dir,
+                        )
+                        break
+                    except Exception as e:
+                        last_launch_error = e
+                        logging.warning(
+                            "Persistent launch failed for %s: %s", user_data_dir, e
+                        )
+                        continue
+
+                if context is None:
+                    logging.error(
+                        "Chrome profile is probably locked by another running Chrome "
+                        "(same user-data-dir). Close Chrome windows using that profile, "
+                        "or start debugging Chrome on port 9222 so CDP attach works:\n"
+                        '  open -na "Google Chrome" --args '
+                        "--remote-debugging-port=9222 --user-data-dir=\"/tmp/vfs-debug-profile\""
+                    )
+                    raise last_launch_error
 
             logging.info("➡ Navigating to login page…")
             page.goto(vfs_url, wait_until="domcontentloaded", timeout=90000)
@@ -157,6 +207,23 @@ class VfsBot(ABC):
                     logging.info(
                         "\033[1;33mNo appointments found for the specified criteria.\033[0m"
                     )
+                    # TEMP: remove after verifying email + Telegram — set
+                    # [notification] test_notify_when_empty = true in config.ini
+                    _test_flag = get_config_value(
+                        "notification", "test_notify_when_empty", ""
+                    )
+                    if str(_test_flag or "").strip().lower() in (
+                        "1",
+                        "true",
+                        "yes",
+                        "on",
+                    ):
+                        crit = ", ".join(appointment_params.values())
+                        self._notify_message(
+                            "[TEST] No slots this run — notification pipeline check only. "
+                            f"Criteria: {crit}. "
+                            "Turn off test_notify_when_empty in [notification] when done."
+                        )
             except Exception as e:
                 logging.error(f"Appointment check failed: {e}")
 
@@ -188,16 +255,23 @@ class VfsBot(ABC):
     def notify_appointment(self, appointment_params: Dict[str, str], dates: List[str]):
         """Send notifications using configured channels."""
         message = f"Found appointment(s) for {', '.join(appointment_params.values())} on {', '.join(dates)}"
+        self._notify_message(message)
+
+    def _notify_message(self, message: str) -> None:
+        """Deliver `message` to every channel in [notification] channels."""
         channels = get_config_value("notification", "channels")
         if not channels:
             logging.warning("No notification channels configured. Skipping notification.")
             return
-        for channel in channels.split(","):
-            client = get_notification_client(channel)
+        for raw in channels.split(","):
+            channel = raw.strip().lower()
+            if not channel:
+                continue
             try:
+                client = get_notification_client(channel)
                 client.send_notification(message)
             except Exception:
-                logging.error(f"Failed to send {channel} notification")
+                logging.exception("Failed to send %s notification", channel)
 
     # ----- Abstracts for country implementations -----
 

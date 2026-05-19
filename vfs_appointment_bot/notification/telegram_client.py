@@ -22,28 +22,32 @@ class TelegramClient(NotificationClient):
         section of the application configuration and validates them using the
         base class validation logic.
         """
-        required_keys = ["bot_token", "chat_id", "parse_mode"]
+        required_keys = ["bot_token", "chat_id"]
         super().__init__("telegram", required_keys)
 
     def send_notification(self, message: str) -> None:
         """
         Sends a notification message through the Telegram channel.
 
-        This method constructs a Telegram API request URL using the retrieved
-        configuration settings (bot token, chat ID, and parse mode) and sends a
-        GET request to the Telegram API with the message content. The response
-        from the Telegram API is logged for debugging purposes.
+        This method sends a POST to the Telegram Bot API with JSON body (avoids
+        broken GET URLs when the message contains spaces or special characters).
+        Optional [telegram] parse_mode applies when set (e.g. HTML, Markdown).
 
         Args:
             message (str): The message content to be sent as a Telegram notification.
         """
         bot_token: str = self.config.get("bot_token")
         chat_id: str = self.config.get("chat_id")
-        parse_mode: str = self.config.get("parse_mode")
+        parse_mode = self.config.get("parse_mode")
 
-        url = (
-            f"https://api.telegram.org/bot{bot_token}/sendMessage?"
-            + f"chat_id={chat_id}&parse_mode={parse_mode}&text={message}"
-        )
-        requests.get(url, timeout=3000).json()
+        payload = {"chat_id": chat_id.strip(), "text": message}
+        if parse_mode and str(parse_mode).strip():
+            payload["parse_mode"] = str(parse_mode).strip()
+
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        resp = requests.post(url, json=payload, timeout=30)
+        data = resp.json()
+        if not data.get("ok"):
+            logging.error("Telegram API error: %s", data)
+            raise RuntimeError(f"Telegram sendMessage failed: {data}")
         logging.info("Telegram message sent successfully!")

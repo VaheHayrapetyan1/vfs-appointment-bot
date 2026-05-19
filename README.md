@@ -167,8 +167,9 @@ It currently supports three notification channels to keep you informed about app
 2. **App Password:** Generate an app password for your Gmail account instead of your regular password. Refer to Google's guide for generating app passwords: [https://support.google.com/accounts/answer/185833?hl=en](https://support.google.com/accounts/answer/185833?hl=en).
 3. **Configuration File:** Update your application's configuration file (`config.ini`) with the following details:
 
-   - **`email` (Required):** Your Gmail address.
+   - **`email` (Required):** Your Gmail address (sender).
    - **`password` (Required):** Your generated Gmail app password.
+   - **`to` (Optional):** Recipient address. If omitted, the alert is sent to **`email`** (yourself).
 
 **Twilio:**
 
@@ -190,7 +191,12 @@ It currently supports three notification channels to keep you informed about app
 2. **Configuration File:** Update your application's configuration file (`config.ini`) with:
 
    - **`bot_token` (Required):** Your Telegram bot token obtained from BotFather.
-   - **`chat_id` (Optional):** The specific Telegram chat ID where you want to receive notifications. If omitted, the bot will send notifications to the chat where it was messaged from. To find your chat ID, you can create a group chat with just yourself and then use the `/my_id` command within the bot.
+   - **`chat_id` (Required):** The Telegram chat ID to receive alerts (e.g. from `@userinfobot` or your bot after you message it).
+   - **`parse_mode` (Optional):** e.g. `HTML` or `Markdown` — only set if you need formatted text.
+
+   In `[notification]`, set `channels=telegram` (comma-separated if you use more than one).
+
+**Test notifications (no slot found):** To verify email/Telegram without a real appointment, add `test_notify_when_empty = true` under `[notification]`. After a full run reports no slots, you get a one-off `[TEST]` message on each configured channel. For **Armenia → Lithuania**, the appointment checker normally polls forever until slots appear; with this flag enabled it **stops after the first empty Tourism check** so notifications can fire. Remove or set to `false` when done.
 
 ## Supported Countries and Appointment Parameters
 

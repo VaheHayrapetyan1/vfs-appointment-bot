@@ -6,6 +6,12 @@ from twilio.rest import Client
 from vfs_appointment_bot.notification.notification_client import NotificationClient
 
 
+def _parse_ini_bool(value: Optional[str], *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 class TwilioClient(NotificationClient):
     """Concrete implementation of NotificationClient for the Twilio channel.
 
@@ -50,7 +56,7 @@ class TwilioClient(NotificationClient):
         account_sid: str = self.config.get("account_sid")
         to_num: str = self.config.get("to_num")
         from_num: str = self.config.get("from_num")
-        call_enabled: bool = self.config.get("call_enabled", False)
+        call_enabled = _parse_ini_bool(self.config.get("call_enabled"), default=False)
 
         self.__send_message(message, auth_token, account_sid, to_num, from_num)
 
