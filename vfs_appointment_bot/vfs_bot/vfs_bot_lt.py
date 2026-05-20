@@ -23,6 +23,94 @@ class VfsBotLt(VfsBot):
             "visa_sub_category",
         ]
 
+    def _log_turnstile_diagnostics(self, page: Page, stage: str) -> None:
+        """
+        Log Cloudflare Turnstile / captcha hints so flaky runs can be compared in app.log.
+
+        Does not interact with the widget; Cloudflare renders most UI inside cross-origin iframes,
+        so we report main-DOM cues and iframe URLs Playwright exposes.
+        """
+        logging.info("[captcha diagnostics] --- stage=%s ---", stage)
+        logging.info("[captcha diagnostics] page.url=%s", page.url)
+
+        loc = page.locator("iframe[src*='turnstile'], iframe[src*='challenges.cloudflare.com']")
+        try:
+            ic = loc.count()
+            logging.info("[captcha diagnostics] main DOM: CF/Turnstile-like iframe count=%s", ic)
+            for i in range(min(ic, 6)):
+                try:
+                    fe = loc.nth(i)
+                    src = (fe.get_attribute("src") or "")[:140]
+                    vis = fe.is_visible()
+                    logging.info(
+                        "[captcha diagnostics] main DOM iframe[%s] visible=%s src_prefix=%s",
+                        i,
+                        vis,
+                        src,
+                    )
+                except Exception as ex:
+                    logging.info("[captcha diagnostics] main DOM iframe[%s] read failed: %s", i, ex)
+        except Exception as e:
+            logging.info("[captcha diagnostics] iframe list failed: %s", e)
+
+        cf_frames: List[str] = []
+        for fr in page.frames:
+            fu = (fr.url or "").strip()
+            if "turnstile" in fu.lower() or "challenges.cloudflare.com" in fu.lower():
+                cf_frames.append(fu[:180])
+        logging.info("[captcha diagnostics] playwright frame URLs matching CF/Turnstile: %s", len(cf_frames))
+        for i, fu in enumerate(cf_frames[:10]):
+            logging.info("[captcha diagnostics] cf_frame[%s]=%s", i, fu)
+
+        for field in ("cf-turnstile-response", "g-recaptcha-response"):
+            try:
+                fld = page.locator(
+                    f"textarea[name='{field}'], input[name='{field}'][type='hidden']"
+                )
+                if fld.count() == 0:
+                    fld = page.locator(f"[name='{field}']")
+                fc = fld.count()
+                if fc == 0:
+                    logging.info(
+                        "[captcha diagnostics] hidden token field '%s' not found in main DOM",
+                        field,
+                    )
+                    continue
+                try:
+                    val = fld.first.input_value(timeout=1500)
+                    logging.info(
+                        "[captcha diagnostics] field '%s' present; value length=%s (0 means not solved yet)",
+                        field,
+                        len(val or ""),
+                    )
+                except Exception:
+                    logging.info(
+                        "[captcha diagnostics] field '%s' present (count=%s) but value not readable",
+                        field,
+                        fc,
+                    )
+            except Exception as e:
+                logging.info("[captcha diagnostics] token field '%s' check failed: %s", field, e)
+
+        try:
+            tip = page.get_by_text(re.compile(r"verify you are human", re.I))
+            if tip.count() > 0:
+                try:
+                    vis = tip.first.is_visible()
+                except Exception:
+                    vis = "unknown"
+                logging.info(
+                    "[captcha diagnostics] main DOM 'Verify you are human' occurrences=%s first_visible=%s",
+                    tip.count(),
+                    vis,
+                )
+            else:
+                logging.info(
+                    "[captcha diagnostics] main DOM: no 'Verify you are human' text (often lives inside iframe only)"
+                )
+        except Exception as e:
+            logging.info("[captcha diagnostics] human-check copy probe skipped: %s", e)
+
     # ---------- Pre-login ----------
     def pre_login_steps(self, page: Page) -> None:
         # Let initial HTML & network settle
@@ -45,12 +133,33 @@ class VfsBotLt(VfsBot):
             except Exception:
                 pass
 
-        # If Turnstile is present, give it a moment
+        # Cloudflare Turnstile: diagnostics + short wait when widget iframe is present.
         try:
-            if page.locator("iframe[src*='turnstile']").first.is_visible():
+            ifr_loc = page.locator(
+                "iframe[src*='turnstile'], iframe[src*='challenges.cloudflare.com']"
+            )
+            n_ts = ifr_loc.count()
+            logging.info(
+                "[captcha diagnostics] pre_login Turnstile/CF iframe count on main DOM: %s", n_ts
+            )
+            self._log_turnstile_diagnostics(page, "pre_login_before_wait")
+
+            first_visible = False
+            if n_ts > 0:
+                try:
+                    first_visible = ifr_loc.first.is_visible(timeout=2000)
+                except Exception:
+                    first_visible = False
+                logging.info(
+                    "[captcha diagnostics] pre_login first such iframe visible=%s; waiting 3s for widget…",
+                    first_visible,
+                )
                 page.wait_for_timeout(3000)
-        except Exception:
-            pass
+
+            self._log_turnstile_diagnostics(page, "pre_login_after_turnstile_wait_block")
+
+        except Exception as e:
+            logging.info("[captcha diagnostics] Turnstile wait section error (non-fatal): %s", e)
 
         # Poll up to 60s for login inputs (main doc or any child frame)
         deadline = time.time() + 60
@@ -76,6 +185,7 @@ class VfsBotLt(VfsBot):
                 login_ctx.locator(selector_email + ":visible").first.wait_for(timeout=15000)
                 login_ctx.locator(selector_pass + ":visible").first.wait_for(timeout=15000)
                 self._login_ctx = login_ctx
+                self._log_turnstile_diagnostics(page, "pre_login_ready_email_password_visible")
                 return
 
             page.wait_for_timeout(1000)
@@ -104,6 +214,8 @@ class VfsBotLt(VfsBot):
         except Exception:
             pass
         pass_box.fill(password, timeout=10000)
+
+        self._log_turnstile_diagnostics(page, "before_sign_in_click")
 
         # Click the Sign In button in that same context
         btn = ctx.get_by_role("button", name=re.compile(r"^\s*Sign\s*In\s*$", re.I))

@@ -1,5 +1,6 @@
-import smtplib
 import logging
+import smtplib
+from email.message import EmailMessage
 
 from vfs_appointment_bot.notification.notification_client import NotificationClient
 
@@ -34,26 +35,16 @@ class EmailClient(NotificationClient):
         to_addr = (
             self.config.get("to") or self.config.get("to_email") or email
         ).strip()
-        email_text = self.__construct_email_text(email, to_addr, message)
+
+        msg = EmailMessage()
+        msg["From"] = email
+        msg["To"] = to_addr
+        msg["Subject"] = "VFS Appointment Bot Notification"
+        msg.set_content(message, charset="utf-8")
+
         smtp_server = smtplib.SMTP_SSL("smtp.gmail.com", 465)
         smtp_server.ehlo()
         smtp_server.login(email, password)
-        smtp_server.sendmail(email, to_addr, email_text)
+        smtp_server.send_message(msg)
         smtp_server.close()
         logging.info("Email sent successfully to %s", to_addr)
-
-    def __construct_email_text(self, from_addr: str, to_addr: str, message: str) -> str:
-        """
-        Constructs a formatted email text with sender, receiver, subject,
-        and message body.
-
-        Args:
-            message (str): The message content to be included in the email body.
-
-        Returns:
-            str: The formatted email text ready for sending.
-        """
-        return (
-            f"From: {from_addr}\nTo: {to_addr}\n"
-            f"Subject: VFS Appointment Bot Notification\n\n{message}"
-        )

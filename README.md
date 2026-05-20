@@ -123,6 +123,13 @@ For an alternative installation method, clone the source code from the project r
 
 **If you installed the script by cloning the repository (manual installation)**, you can directly edit the values in `config/config.ini`.
 
+**VFS website login (primary + optional fallback):** On every bot run, the site is opened once and login is attempted in order:
+
+- **Primary:** `[vfs-account-1]` if both `email` and `password` are set; otherwise `[vfs-credential]`.
+- **Fallback:** If primary login fails or the page shows access restriction (e.g. 429001), the login URL is loaded again and `[vfs-account-2]` is tried when configured (duplicate emails are skipped).
+
+Appointment checking and notifications are unchanged after a successful login.
+
 ## Usage
 
 1. **Command-Line Argument:**

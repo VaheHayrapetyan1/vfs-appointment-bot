@@ -1,9 +1,10 @@
 import argparse
 import logging
 import os
+import re
 import time
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
 import playwright
@@ -48,6 +49,73 @@ class VfsBot(ABC):
         logging.info(f"📄 Saved HTML to {html}")
         logging.info(f"🌐 Current URL: {page.url}")
 
+    @staticmethod
+    def _get_vfs_login_accounts() -> List[Tuple[str, str]]:
+        """
+        Ordered accounts: primary first, then optional fallback.
+        Primary = [vfs-account-1] if present, else [vfs-credential].
+        Adds [vfs-account-2] when set (skips duplicate emails).
+        """
+        pairs: List[Tuple[str, str]] = []
+
+        def _add(email: Optional[str], pw: Optional[str]) -> None:
+            if not email or not pw:
+                return
+            e, p = str(email).strip(), str(pw).strip()
+            if not e or not p:
+                return
+            if any(existing[0].lower() == e.lower() for existing in pairs):
+                return
+            pairs.append((e, p))
+
+        a1e = get_config_value("vfs-account-1", "email")
+        a1p = get_config_value("vfs-account-1", "password")
+        cre = get_config_value("vfs-credential", "email")
+        crp = get_config_value("vfs-credential", "password")
+        if a1e and a1p:
+            _add(a1e, a1p)
+        elif cre and crp:
+            _add(cre, crp)
+
+        a2e = get_config_value("vfs-account-2", "email")
+        a2p = get_config_value("vfs-account-2", "password")
+        _add(a2e, a2p)
+
+        if not pairs:
+            raise RuntimeError(
+                "No VFS credentials: set [vfs-account-1] or [vfs-credential], "
+                "optional [vfs-account-2] for fallback after primary fails."
+            )
+        return pairs
+
+    @staticmethod
+    def _vfs_access_restricted(page) -> bool:
+        """True when VFS shows access / user restriction (e.g. 429001) on the page."""
+        try:
+            snippet = page.get_by_text(
+                re.compile(
+                    r"access restricted|429001|unusual activity|user id\s*\(429",
+                    re.I,
+                )
+            )
+            if snippet.count() > 0:
+                try:
+                    if snippet.first.is_visible():
+                        return True
+                except Exception:
+                    return True
+        except Exception:
+            pass
+        try:
+            html = (page.content() or "").lower()
+            if "429001" in html and "restricted" in html:
+                return True
+            if "access restricted for user id" in html:
+                return True
+        except Exception:
+            pass
+        return False
+
     def run(self, args: argparse.Namespace = None) -> bool:
         """
         Starts the VFS bot for appointment checking and notification.
@@ -64,8 +132,11 @@ class VfsBot(ABC):
             logging.error(f"Missing configuration value: {e}")
             return False
 
-        email_id = get_config_value("vfs-credential", "email")
-        password = get_config_value("vfs-credential", "password")
+        try:
+            vfs_accounts = self._get_vfs_login_accounts()
+        except RuntimeError as e:
+            logging.error("%s", e)
+            return False
 
         appointment_params = self.get_appointment_params(args)
 
@@ -158,29 +229,87 @@ class VfsBot(ABC):
 
             self._dump_debug(page, "after_goto")
 
-            logging.info("➡ Running pre-login steps…")
-            try:
-                self.pre_login_steps(page)
-                logging.info("✅ pre_login_steps() completed.")
-            except Exception as e:
-                logging.info(f"Pre-login step error: {e}")
-                self._dump_debug(page, "prelogin_fail")
-                # Close cleanly
-                try:
-                    if connected_via_cdp:
-                        browser.close()
-                    else:
-                        context.close()
-                except Exception:
-                    pass
-                raise
+            logged_in = False
+            for acc_index, (email_id, password) in enumerate(vfs_accounts):
+                if acc_index > 0:
+                    logging.info(
+                        "➡ Reloading login page for fallback account %s/%s…",
+                        acc_index + 1,
+                        len(vfs_accounts),
+                    )
+                    page.goto(vfs_url, wait_until="domcontentloaded", timeout=90000)
+                    try:
+                        page.wait_for_selector("#loader", state="hidden", timeout=60000)
+                    except Exception:
+                        pass
+                    self._dump_debug(page, f"after_goto_account_{acc_index + 1}")
 
-            try:
-                self.login(page, email_id, password)
-                logging.info("✅ Logged in successfully")
-            except Exception:
-                self._dump_debug(page, "login_fail")
-                # Close cleanly
+                logging.info("➡ Running pre-login steps…")
+                try:
+                    self.pre_login_steps(page)
+                    logging.info("✅ pre_login_steps() completed.")
+                except Exception as e:
+                    logging.info(f"Pre-login step error: {e}")
+                    self._dump_debug(page, "prelogin_fail")
+                    try:
+                        if connected_via_cdp:
+                            browser.close()
+                        else:
+                            context.close()
+                    except Exception:
+                        pass
+                    raise
+
+                logging.info(
+                    "➡ Attempting VFS login (%s/%s) as %s…",
+                    acc_index + 1,
+                    len(vfs_accounts),
+                    email_id,
+                )
+                try:
+                    self.login(page, email_id, password)
+                except Exception as e:
+                    logging.warning("VFS login failed for %s: %s", email_id, e)
+                    self._dump_debug(page, "login_fail")
+                    if acc_index < len(vfs_accounts) - 1:
+                        continue
+                    try:
+                        if connected_via_cdp:
+                            browser.close()
+                        else:
+                            context.close()
+                    except Exception:
+                        pass
+                    raise LoginError(
+                        "\033[1;31mLogin failed for all configured accounts. "
+                        "Verify passwords and VFS access, then try again.\033[0m"
+                    )
+
+                if self._vfs_access_restricted(page):
+                    logging.warning(
+                        "VFS access restriction detected for %s; trying next account if any.",
+                        email_id,
+                    )
+                    self._dump_debug(page, "access_restricted")
+                    if acc_index < len(vfs_accounts) - 1:
+                        continue
+                    try:
+                        if connected_via_cdp:
+                            browser.close()
+                        else:
+                            context.close()
+                    except Exception:
+                        pass
+                    raise LoginError(
+                        "\033[1;31mAccess restricted for all configured accounts "
+                        "(e.g. 429001). Use Contact Us or wait, then retry.\033[0m"
+                    )
+
+                logged_in = True
+                logging.info("✅ Logged in successfully as %s", email_id)
+                break
+
+            if not logged_in:
                 try:
                     if connected_via_cdp:
                         browser.close()
@@ -189,8 +318,7 @@ class VfsBot(ABC):
                 except Exception:
                     pass
                 raise LoginError(
-                    "\033[1;31mLogin failed. "
-                    "Please verify your username and password by logging in to the browser and try again.\033[0m"
+                    "\033[1;31mLogin failed. No account succeeded.\033[0m"
                 )
 
             logging.info(f"Checking appointments for {appointment_params}")
