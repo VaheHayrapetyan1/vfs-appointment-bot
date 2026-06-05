@@ -126,9 +126,13 @@ For an alternative installation method, clone the source code from the project r
 **VFS website login (primary + optional fallback):** On every bot run, the site is opened once and login is attempted in order:
 
 - **Primary:** `[vfs-account-1]` if both `email` and `password` are set; otherwise `[vfs-credential]`.
-- **Fallback:** If primary login fails or the page shows access restriction (e.g. 429001), the login URL is loaded again and `[vfs-account-2]` is tried when configured (duplicate emails are skipped).
+- **Fallback:** If primary login fails or the page shows access restriction (e.g. 429001), the login URL is loaded again and `[vfs-account-2]` through `[vfs-account-10]` are tried in order when configured (duplicate emails are skipped). Add those sections in the same `config.ini` as `[vfs-account-1]` (see [`config/vfs_accounts_345.ini.sample`](config/vfs_accounts_345.ini.sample) for a copy-paste fragment).
 
 Appointment checking and notifications are unchanged after a successful login.
+
+**Availability alerts:** When `div.alert` blocks contain bookable dates, the bot parses common formats (`DD-MM-YYYY`, `DD/MM/YYYY`, `YYYY-MM-DD`, spelled English months, etc.), normalizes them to **ISO `YYYY-MM-DD`**, and sends **Telegram/email** with a summary line plus **`VFS alert(s):`** bullet(s) containing the **verbatim** alert text (trimmed) so wording changes on the site are still visible in the notification.
+
+In `[default]`, **`connectivity_retry_seconds`** (default `15`) is the wait after **page-not-found / 502-style** VFS errors before the next full run; **`interval`** is used after a normal “no slots” completion.
 
 ## Usage
 

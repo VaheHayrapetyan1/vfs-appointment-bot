@@ -1,9 +1,13 @@
 import logging
-from typing import Dict, List, Optional
+from typing import Dict
 
 from playwright.sync_api import Page
 
-from vfs_appointment_bot.utils.date_utils import extract_date_from_string
+from vfs_appointment_bot.utils.appointment_availability import (
+    AppointmentScanResult,
+    truncate_excerpt,
+)
+from vfs_appointment_bot.utils.date_utils import extract_all_dates_normalized
 from vfs_appointment_bot.vfs_bot.vfs_bot import VfsBot
 
 
@@ -82,23 +86,21 @@ class VfsBotDe(VfsBot):
 
     def check_for_appointment(
         self, page: Page, appointment_params: Dict[str, str]
-    ) -> Optional[List[str]]:
+    ) -> AppointmentScanResult:
         """
         Checks for appointments on the German VFS website based on provided parameters.
 
         This method clicks the "Start New Booking" button, selects the specified
         visa center, category, and subcategory based on the `appointment_params`
         dictionary. It then extracts the available appointment dates from the
-        website and returns them as a list. If no appointments are found, it
-        returns None.
+        website. If the alert area cannot be read, returns an empty scan.
 
         Args:
             page (playwright.sync_api.Page): The Playwright page object used for browser interaction.
             appointment_params (Dict[str, str]): A dictionary containing appointment search criteria.
 
         Returns:
-            Optional[List[str]]: A list of available appointment dates (empty list if none found),
-                including a timestamp of the check, or None if no appointments found.
+            AppointmentScanResult: Parsed ISO dates (YYYY-MM-DD) and raw alert excerpts.
         """
         page.get_by_role("button", name="Start New Booking").click()
 
@@ -130,14 +132,23 @@ class VfsBotDe(VfsBot):
         try:
             page.wait_for_selector("div.alert")
             appointment_date_elements = page.query_selector_all("div.alert")
-            appointment_dates = []
+            ordered_iso: list[str] = []
+            seen: set[str] = set()
+            excerpts: list[str] = []
             for appointment_date_element in appointment_date_elements:
-                appointment_date_text = appointment_date_element.text_content()
-                appointment_date = extract_date_from_string(appointment_date_text)
-                if appointment_date is not None and len(appointment_date) > 0:
-                    appointment_dates.append(appointment_date)
-            return appointment_dates
+                appointment_date_text = (appointment_date_element.text_content() or "").strip()
+                if not appointment_date_text:
+                    continue
+                found = extract_all_dates_normalized(appointment_date_text)
+                if not found:
+                    continue
+                for dt in found:
+                    if dt not in seen:
+                        seen.add(dt)
+                        ordered_iso.append(dt)
+                excerpt = truncate_excerpt(appointment_date_text)
+                if excerpt and excerpt not in excerpts:
+                    excerpts.append(excerpt)
+            return AppointmentScanResult(tuple(ordered_iso), tuple(excerpts))
         except Exception:
-            return None
-
-        return None
+            return AppointmentScanResult.empty()

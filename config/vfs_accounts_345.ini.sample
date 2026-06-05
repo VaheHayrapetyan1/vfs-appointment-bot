@@ -1,0 +1,36 @@
+; Optional fallback VFS logins (sections 3–10).
+; Merge into your main config.ini (same file as [vfs-account-1] / [vfs-account-2]),
+; or copy this file into config/ as another .ini alongside your others.
+; Add the real password for each line below (leave empty until set — empty password is ignored).
+
+[vfs-account-3]
+email = vahe240422+1@gmail.com
+password =
+
+[vfs-account-4]
+email = vahe240422+2@gmail.com
+password =
+
+[vfs-account-5]
+email = vahe240422+3@gmail.com
+password =
+
+[vfs-account-6]
+email = vahe240422+4@gmail.com
+password =
+
+[vfs-account-7]
+email = vahe240422+5@gmail.com
+password =
+
+[vfs-account-8]
+email = vahe240422+6@gmail.com
+password =
+
+[vfs-account-9]
+email = vahe240422+7@gmail.com
+password =
+
+[vfs-account-10]
+email = vahe240422+8@gmail.com
+password =

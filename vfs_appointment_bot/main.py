@@ -3,9 +3,17 @@ import logging
 import sys
 from typing import Dict
 
+from vfs_appointment_bot.utils.browser_profile import (
+    clear_vfs_browser_fingerprints,
+    quit_cdp_chrome,
+)
 from vfs_appointment_bot.utils.config_reader import get_config_value, initialize_config
 from vfs_appointment_bot.utils.timer import countdown
-from vfs_appointment_bot.vfs_bot.vfs_bot import LoginError
+from vfs_appointment_bot.vfs_bot.vfs_bot import (
+    LoginError,
+    VfsConnectivityError,
+    VfsRateLimitError,
+)
 from vfs_appointment_bot.vfs_bot.vfs_bot_factory import (
     UnsupportedCountryError,
     get_vfs_bot,
@@ -31,6 +39,40 @@ class KeyValueAction(argparse.Action):
             parser.error(
                 f"Invalid value format for {option_string}, use key=value pairs"
             )
+
+
+def _restriction_sleep_seconds() -> int:
+    cooldown = get_config_value("anti_lock", "restriction_sleep_seconds", "7200")
+    try:
+        sec = int(cooldown or "7200")
+    except ValueError:
+        sec = 7200
+    return max(60, min(sec, 86_400))
+
+
+def _handle_long_cooldown(
+    exc: Exception,
+    *,
+    countdown_label: str,
+    telegram_intro: str,
+) -> None:
+    """Wait restriction_sleep_seconds, wipe browser profiles, then outer loop continues."""
+    logging.warning("%s", exc)
+    sec = _restriction_sleep_seconds()
+    _h, _m = sec // 3600, (sec % 3600) // 60
+    try:
+        from vfs_appointment_bot.notification.telegram_client import TelegramClient
+
+        TelegramClient().send_notification(
+            f"{telegram_intro} (~{_h}h {_m}m). "
+            "Browser profile will be cleared before the next attempt.\n\n"
+            f"{exc}"
+        )
+    except Exception as alert_err:
+        logging.warning("Could not send Telegram alert for long cooldown: %s", alert_err)
+    countdown(sec, countdown_label)
+    quit_cdp_chrome()
+    clear_vfs_browser_fingerprints()
 
 
 def main() -> None:
@@ -89,7 +131,41 @@ def main() -> None:
     try:
         while True:
             vfs_bot = get_vfs_bot(source_country_code, destination_country_code)
-            appointment_found = vfs_bot.run(args)
+            try:
+                appointment_found = vfs_bot.run(args)
+            except VfsRateLimitError as e:
+                _handle_long_cooldown(
+                    e,
+                    countdown_label=(
+                        "VFS rate limit / permission cooldown (e.g. 429201) — next run after"
+                    ),
+                    telegram_intro=(
+                        "VFS bot: permission / rate limit (e.g. 429201) — every configured "
+                        "account was blocked this run. Entering long cooldown. "
+                        "Try another Wi‑Fi/VPN if needed"
+                    ),
+                )
+                continue
+            except LoginError as e:
+                _handle_long_cooldown(
+                    e,
+                    countdown_label="All accounts failed login — long cooldown, next run after",
+                    telegram_intro=(
+                        "VFS bot: every configured account failed login this run "
+                        "(passwords, VFS errors, or page-not-found). Entering long cooldown"
+                    ),
+                )
+                continue
+            except VfsConnectivityError:
+                countdown(
+                    int(
+                        get_config_value(
+                            "default", "connectivity_retry_seconds", "15"
+                        )
+                    ),
+                    "Next retry after VFS connectivity / page-not-found",
+                )
+                continue
             if appointment_found:
                 break
             countdown(
@@ -97,7 +173,7 @@ def main() -> None:
                 "Next appointment check in",
             )
 
-    except (UnsupportedCountryError, LoginError) as e:
+    except UnsupportedCountryError as e:
         logging.error(e)
     except Exception as e:
         logging.exception(e)

@@ -10,6 +10,12 @@ from pathlib import Path
 import playwright
 from playwright.sync_api import sync_playwright
 
+from vfs_appointment_bot.utils.appointment_availability import AppointmentScanResult
+from vfs_appointment_bot.utils.browser_profile import (
+    cdp_port,
+    ensure_cdp_chrome_ready,
+    quit_cdp_chrome,
+)
 from vfs_appointment_bot.utils.config_reader import get_config_value
 from vfs_appointment_bot.notification.notification_client_factory import (
     get_notification_client,
@@ -18,6 +24,14 @@ from vfs_appointment_bot.notification.notification_client_factory import (
 
 class LoginError(Exception):
     """Exception raised when login fails."""
+
+
+class VfsConnectivityError(RuntimeError):
+    """Transient VFS outage (page-not-found, 502, etc.) — outer loop retries sooner."""
+
+
+class VfsRateLimitError(RuntimeError):
+    """VFS anti-automation / permission (e.g. 429201) — IP cooldown; retry after a long wait."""
 
 
 class VfsBot(ABC):
@@ -52,9 +66,9 @@ class VfsBot(ABC):
     @staticmethod
     def _get_vfs_login_accounts() -> List[Tuple[str, str]]:
         """
-        Ordered accounts: primary first, then optional fallback.
+        Ordered accounts: primary first, then optional fallbacks in section order.
         Primary = [vfs-account-1] if present, else [vfs-credential].
-        Adds [vfs-account-2] when set (skips duplicate emails).
+        Then [vfs-account-2] … [vfs-account-10] when set (skips duplicate emails).
         """
         pairs: List[Tuple[str, str]] = []
 
@@ -77,14 +91,17 @@ class VfsBot(ABC):
         elif cre and crp:
             _add(cre, crp)
 
-        a2e = get_config_value("vfs-account-2", "email")
-        a2p = get_config_value("vfs-account-2", "password")
-        _add(a2e, a2p)
+        for n in range(2, 11):
+            section = f"vfs-account-{n}"
+            _add(
+                get_config_value(section, "email"),
+                get_config_value(section, "password"),
+            )
 
         if not pairs:
             raise RuntimeError(
                 "No VFS credentials: set [vfs-account-1] or [vfs-credential], "
-                "optional [vfs-account-2] for fallback after primary fails."
+                "optional [vfs-account-2] … [vfs-account-10] for fallbacks after primary fails."
             )
         return pairs
 
@@ -115,6 +132,31 @@ class VfsBot(ABC):
         except Exception:
             pass
         return False
+
+    @staticmethod
+    def _close_playwright_browser(
+        connected_via_cdp: bool,
+        browser,
+        context,
+    ) -> None:
+        """
+        Close Playwright resources when a run ends (success or failure).
+
+        - CDP: disconnect Playwright, then quit the Chrome process for our debug profile.
+        - Persistent context: ``context.close()`` shuts down Playwright-launched Chrome.
+        """
+        try:
+            if connected_via_cdp and browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+                quit_cdp_chrome()
+            elif context is not None:
+                context.close()
+                logging.info("🧹 Closed Playwright Chrome (persistent context).")
+        except Exception as ex:
+            logging.warning("Browser/context cleanup: %s", ex)
 
     def run(self, args: argparse.Namespace = None) -> bool:
         """
@@ -147,20 +189,29 @@ class VfsBot(ABC):
             browser = None
             connected_via_cdp = False
 
-            # Try to attach to a real Chrome started with --remote-debugging-port=9222
-            try:
-                logging.info("🔌 Trying to attach to Chrome over CDP (localhost:9222)…")
-                browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
-                context = browser.contexts[0] if browser.contexts else browser.new_context()
-                page = (
-                    context.pages[0]
-                    if context.pages
-                    else context.new_page()
-                )
-                connected_via_cdp = True
-                logging.info("✅ Attached via CDP.")
-            except Exception:
-                logging.info("ℹ️ CDP attach failed — launching persistent Chrome profile instead…")
+            cdp_url = f"http://127.0.0.1:{cdp_port()}"
+            if ensure_cdp_chrome_ready():
+                try:
+                    logging.info("🔌 Trying to attach to Chrome over CDP (%s)…", cdp_url)
+                    browser = p.chromium.connect_over_cdp(cdp_url)
+                    context = (
+                        browser.contexts[0] if browser.contexts else browser.new_context()
+                    )
+                    page = (
+                        context.pages[0]
+                        if context.pages
+                        else context.new_page()
+                    )
+                    connected_via_cdp = True
+                    logging.info("✅ Attached via CDP.")
+                except Exception as exc:
+                    logging.info(
+                        "ℹ️ CDP attach failed (%s) — falling back to persistent Chrome…",
+                        exc,
+                    )
+
+            if not connected_via_cdp:
+                logging.info("Launching persistent Chrome profile…")
                 base_profile = get_config_value(
                     "browser", "user_data_dir", "/tmp/vfs-profile"
                 )
@@ -218,153 +269,164 @@ class VfsBot(ABC):
                     )
                     raise last_launch_error
 
-            logging.info("➡ Navigating to login page…")
-            page.goto(vfs_url, wait_until="domcontentloaded", timeout=90000)
-
-            # Wait for the Angular app to finish loading after Cloudflare check
             try:
-                page.wait_for_selector("#loader", state="hidden", timeout=60000)
-            except Exception:
-                pass
+                logging.info("➡ Navigating to login page…")
+                page.goto(vfs_url, wait_until="domcontentloaded", timeout=90000)
 
-            self._dump_debug(page, "after_goto")
-
-            logged_in = False
-            for acc_index, (email_id, password) in enumerate(vfs_accounts):
-                if acc_index > 0:
-                    logging.info(
-                        "➡ Reloading login page for fallback account %s/%s…",
-                        acc_index + 1,
-                        len(vfs_accounts),
-                    )
-                    page.goto(vfs_url, wait_until="domcontentloaded", timeout=90000)
-                    try:
-                        page.wait_for_selector("#loader", state="hidden", timeout=60000)
-                    except Exception:
-                        pass
-                    self._dump_debug(page, f"after_goto_account_{acc_index + 1}")
-
-                logging.info("➡ Running pre-login steps…")
+                # Wait for the Angular app to finish loading after Cloudflare check
                 try:
-                    self.pre_login_steps(page)
-                    logging.info("✅ pre_login_steps() completed.")
-                except Exception as e:
-                    logging.info(f"Pre-login step error: {e}")
-                    self._dump_debug(page, "prelogin_fail")
-                    try:
-                        if connected_via_cdp:
-                            browser.close()
-                        else:
-                            context.close()
-                    except Exception:
-                        pass
-                    raise
-
-                logging.info(
-                    "➡ Attempting VFS login (%s/%s) as %s…",
-                    acc_index + 1,
-                    len(vfs_accounts),
-                    email_id,
-                )
-                try:
-                    self.login(page, email_id, password)
-                except Exception as e:
-                    logging.warning("VFS login failed for %s: %s", email_id, e)
-                    self._dump_debug(page, "login_fail")
-                    if acc_index < len(vfs_accounts) - 1:
-                        continue
-                    try:
-                        if connected_via_cdp:
-                            browser.close()
-                        else:
-                            context.close()
-                    except Exception:
-                        pass
-                    raise LoginError(
-                        "\033[1;31mLogin failed for all configured accounts. "
-                        "Verify passwords and VFS access, then try again.\033[0m"
-                    )
-
-                if self._vfs_access_restricted(page):
-                    logging.warning(
-                        "VFS access restriction detected for %s; trying next account if any.",
-                        email_id,
-                    )
-                    self._dump_debug(page, "access_restricted")
-                    if acc_index < len(vfs_accounts) - 1:
-                        continue
-                    try:
-                        if connected_via_cdp:
-                            browser.close()
-                        else:
-                            context.close()
-                    except Exception:
-                        pass
-                    raise LoginError(
-                        "\033[1;31mAccess restricted for all configured accounts "
-                        "(e.g. 429001). Use Contact Us or wait, then retry.\033[0m"
-                    )
-
-                logged_in = True
-                logging.info("✅ Logged in successfully as %s", email_id)
-                break
-
-            if not logged_in:
-                try:
-                    if connected_via_cdp:
-                        browser.close()
-                    else:
-                        context.close()
+                    page.wait_for_selector("#loader", state="hidden", timeout=60000)
                 except Exception:
                     pass
-                raise LoginError(
-                    "\033[1;31mLogin failed. No account succeeded.\033[0m"
-                )
 
-            logging.info(f"Checking appointments for {appointment_params}")
-            appointment_found = False
-            try:
-                dates = self.check_for_appointment(page, appointment_params)
-                if dates:
-                    logging.info(
-                        f"\033[1;32mFound appointments on: {', '.join(dates)} \033[0m"
-                    )
-                    self.notify_appointment(appointment_params, dates)
-                    appointment_found = True
-                else:
-                    logging.info(
-                        "\033[1;33mNo appointments found for the specified criteria.\033[0m"
-                    )
-                    # TEMP: remove after verifying email + Telegram — set
-                    # [notification] test_notify_when_empty = true in config.ini
-                    _test_flag = get_config_value(
-                        "notification", "test_notify_when_empty", ""
-                    )
-                    if str(_test_flag or "").strip().lower() in (
-                        "1",
-                        "true",
-                        "yes",
-                        "on",
-                    ):
-                        crit = ", ".join(appointment_params.values())
-                        self._notify_message(
-                            "[TEST] No slots this run — notification pipeline check only. "
-                            f"Criteria: {crit}. "
-                            "Turn off test_notify_when_empty in [notification] when done."
+                self._dump_debug(page, "after_goto")
+
+                appointment_found = False
+                connectivity_error: Optional[VfsConnectivityError] = None
+
+                for acc_index, (email_id, password) in enumerate(vfs_accounts):
+                    if acc_index > 0:
+                        logging.info(
+                            "➡ Reloading login page for fallback account %s/%s…",
+                            acc_index + 1,
+                            len(vfs_accounts),
                         )
-            except Exception as e:
-                logging.error(f"Appointment check failed: {e}")
+                        try:
+                            context.clear_cookies()
+                        except Exception:
+                            pass
+                        page.goto(vfs_url, wait_until="domcontentloaded", timeout=90000)
+                        try:
+                            page.wait_for_selector("#loader", state="hidden", timeout=60000)
+                        except Exception:
+                            pass
+                        self._dump_debug(page, f"after_goto_account_{acc_index + 1}")
 
-            # Close connection/context (don’t kill your real Chrome when attached)
-            try:
-                if connected_via_cdp:
-                    browser.close()      # closes the CDP connection only
-                else:
-                    context.close()
-            except Exception:
-                pass
+                    logging.info("➡ Running pre-login steps…")
+                    try:
+                        self.pre_login_steps(page)
+                        logging.info("✅ pre_login_steps() completed.")
+                    except VfsRateLimitError as e:
+                        logging.warning(
+                            "VFS rate limit during pre-login (%s/%s, %s): %s",
+                            acc_index + 1,
+                            len(vfs_accounts),
+                            email_id,
+                            e,
+                        )
+                        self._dump_debug(page, "prelogin_rate_limit")
+                        if acc_index < len(vfs_accounts) - 1:
+                            continue
+                        raise
+                    except Exception as e:
+                        logging.info(f"Pre-login step error: {e}")
+                        self._dump_debug(page, "prelogin_fail")
+                        raise
 
-            return appointment_found
+                    logging.info(
+                        "➡ Attempting VFS login (%s/%s) as %s…",
+                        acc_index + 1,
+                        len(vfs_accounts),
+                        email_id,
+                    )
+                    try:
+                        self.login(page, email_id, password)
+                    except VfsRateLimitError as e:
+                        logging.warning(
+                            "VFS rate limit during login (%s/%s, %s): %s",
+                            acc_index + 1,
+                            len(vfs_accounts),
+                            email_id,
+                            e,
+                        )
+                        self._dump_debug(page, "login_rate_limit")
+                        if acc_index < len(vfs_accounts) - 1:
+                            continue
+                        raise
+                    except Exception as e:
+                        logging.warning("VFS login failed for %s: %s", email_id, e)
+                        self._dump_debug(page, "login_fail")
+                        if acc_index < len(vfs_accounts) - 1:
+                            continue
+                        raise LoginError(
+                            "\033[1;31mLogin failed for all configured accounts. "
+                            "Verify passwords and VFS access, then try again.\033[0m"
+                        )
+
+                    if self._vfs_access_restricted(page):
+                        logging.warning(
+                            "VFS access restriction detected for %s; trying next account if any.",
+                            email_id,
+                        )
+                        self._dump_debug(page, "access_restricted")
+                        if acc_index < len(vfs_accounts) - 1:
+                            continue
+                        raise LoginError(
+                            "\033[1;31mAccess restricted for all configured accounts "
+                            "(e.g. 429001). Use Contact Us or wait, then retry.\033[0m"
+                        )
+
+                    logging.info("✅ Logged in successfully as %s", email_id)
+
+                    logging.info(f"Checking appointments for {appointment_params}")
+                    try:
+                        scan = self.check_for_appointment(page, appointment_params)
+                        if scan.has_dates:
+                            logging.info(
+                                "\033[1;32mFound appointments on: %s\033[0m",
+                                ", ".join(scan.dates_iso),
+                            )
+                            self.notify_appointment(appointment_params, scan)
+                            appointment_found = True
+                        else:
+                            logging.info(
+                                "\033[1;33mNo appointments found for the specified criteria.\033[0m"
+                            )
+                            _test_flag = get_config_value(
+                                "notification", "test_notify_when_empty", ""
+                            )
+                            if str(_test_flag or "").strip().lower() in (
+                                "1",
+                                "true",
+                                "yes",
+                                "on",
+                            ):
+                                crit = ", ".join(appointment_params.values())
+                                self._notify_message(
+                                    "[TEST] No slots this run — notification pipeline check only. "
+                                    f"Criteria: {crit}. "
+                                    "Turn off test_notify_when_empty in [notification] when done."
+                                )
+                    except VfsRateLimitError as e:
+                        logging.warning(
+                            "VFS rate limit during appointment check (%s/%s, %s): %s",
+                            acc_index + 1,
+                            len(vfs_accounts),
+                            email_id,
+                            e,
+                        )
+                        self._dump_debug(page, "appointment_rate_limit")
+                        if acc_index < len(vfs_accounts) - 1:
+                            continue
+                        raise
+                    except VfsConnectivityError as e:
+                        logging.error("Appointment check failed: %s", e)
+                        connectivity_error = e
+                        break
+                    except Exception as e:
+                        logging.error(f"Appointment check failed: {e}")
+                        appointment_found = False
+                        break
+
+                    break
+
+                if connectivity_error:
+                    raise connectivity_error
+
+                return appointment_found
+            finally:
+                self._close_playwright_browser(connected_via_cdp, browser, context)
+
 
     def get_appointment_params(self, args: argparse.Namespace) -> Dict[str, str]:
         """Read appointment params from CLI or prompt once."""
@@ -380,10 +442,17 @@ class VfsBot(ABC):
                 appointment_params[key] = input(f"Enter the {key_name}: ")
         return appointment_params
 
-    def notify_appointment(self, appointment_params: Dict[str, str], dates: List[str]):
+    def notify_appointment(
+        self, appointment_params: Dict[str, str], scan: AppointmentScanResult
+    ) -> None:
         """Send notifications using configured channels."""
-        message = f"Found appointment(s) for {', '.join(appointment_params.values())} on {', '.join(dates)}"
-        self._notify_message(message)
+        criteria = ", ".join(appointment_params.values())
+        dates_line = ", ".join(scan.dates_iso)
+        parts = [f"Found appointment(s) for {criteria} on {dates_line}"]
+        if scan.alert_excerpts:
+            bullets = "\n".join(f"• {ex}" for ex in scan.alert_excerpts)
+            parts.append(f"VFS alert(s):\n{bullets}")
+        self._notify_message("\n\n".join(parts))
 
     def _notify_message(self, message: str) -> None:
         """Deliver `message` to every channel in [notification] channels."""
@@ -416,5 +485,5 @@ class VfsBot(ABC):
     @abstractmethod
     def check_for_appointment(
         self, page: playwright.sync_api.Page, appointment_params: Dict[str, str]
-    ) -> List[str]:
+    ) -> AppointmentScanResult:
         raise NotImplementedError
